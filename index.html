@@ -168,7 +168,7 @@
 
   // ---------- 8-bit audio (Web Audio, no files) ----------
   const Sound = (() => {
-    let ac = null, master = null, noiseBuf = null, muted = false;
+    let ac = null, master = null, noiseBuf = null, muted = false, swF = null, swG = null, swSpeed = 0;
     try { muted = localStorage.getItem('lidflap-muted') === '1'; } catch (e) {}
     const mtof = m => 440 * Math.pow(2, (m - 69) / 12);
 
@@ -179,6 +179,11 @@
       noiseBuf = ac.createBuffer(1, ac.sampleRate, ac.sampleRate);
       const d = noiseBuf.getChannelData(0);
       for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
+      // Swoosh: looping noise -> bandpass -> gain, driven every frame by the bird's speed.
+      const src = ac.createBufferSource(); src.buffer = noiseBuf; src.loop = true;
+      swF = ac.createBiquadFilter(); swF.type = 'bandpass'; swF.frequency.value = 500; swF.Q.value = 1.2;
+      swG = ac.createGain(); swG.gain.value = 0;
+      src.connect(swF); swF.connect(swG); swG.connect(master); src.start();
     }
     function tone(freq, t, dur, type = 'square', vol = 0.2, slideTo = 0) {
       if (!ac) return;
@@ -225,6 +230,14 @@
       },
       startMusic() { if (!ac || playing) return; playing = true; step = 0; nextT = ac.currentTime + 0.05; timer = setInterval(tick, 25); },
       stopMusic() { playing = false; clearInterval(timer); },
+      // speed in px/s; smoothed so whole-degree sensor steps don't crackle
+      swoosh(speed) {
+        if (!swG) return;
+        swSpeed += (speed - swSpeed) * 0.15;
+        const v = Math.min(1, swSpeed / 900);
+        swG.gain.setTargetAtTime(0.06 * v * v, ac.currentTime, 0.04);
+        swF.frequency.setTargetAtTime(400 + 1800 * v, ac.currentTime, 0.04);
+      },
       setIntensity(d) { bpm = 140 + 90 * Math.min(1.2, d); },
       confirm() { const t = now(); tone(880, t, 0.07); tone(1320, t + 0.07, 0.1); },
       error() { const t = now(); tone(140, t, 0.18, 'square', 0.18); tone(110, t + 0.12, 0.2, 'square', 0.18); },
@@ -272,6 +285,7 @@
 
     for (const c of clouds) { c.x -= dt * 20 * c.s; if (c.x < -120) { c.x = W + 60; c.y = 40 + Math.random() * 160; } }
 
+    Sound.swoosh(state === 'test' || state === 'play' ? Math.abs(bird.vy) : 0);
     if (state === 'connect' || state === 'calBottom' || state === 'calTop') {
       bird.y += (H / 2 - 30 - bird.y) * Math.min(1, dt * 5);
       bird.tilt = 0;
