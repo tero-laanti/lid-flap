@@ -169,12 +169,15 @@
   const TOP_Y = R + 10, BOT_Y = H - GROUND - R - 10; // bird's reachable band
   let state = 'connect', score = 0, best = 0, t = 0;
   try { best = +localStorage.getItem('lidflap-best') || 0; } catch (e) {}
-  let bird, pipes, speed, gap, spawnTimer, particles, clouds;
+  let bird, pipes, speed, gap, spawnTimer, particles, clouds, playT = 0;
+  // Difficulty is time-based: d = 0 at start, 1 at IMPOSSIBLE_AT seconds.
+  const IMPOSSIBLE_AT = 90;
+  const diff = () => playT / IMPOSSIBLE_AT;
 
   function reset() {
     bird = { y: H / 2, vy: 0, tilt: 0 };
     pipes = []; particles = [];
-    speed = 190; gap = 190; spawnTimer = 0.6; score = 0;
+    speed = 220; gap = 200; spawnTimer = 0.6; score = 0; playT = 0;
   }
   clouds = Array.from({ length: 6 }, (_, i) => ({ x: i * 170 + Math.random() * 80, y: 40 + Math.random() * 160, s: 0.6 + Math.random() * 0.8 }));
   reset();
@@ -183,7 +186,7 @@
     const minTop = 50, maxTop = H - GROUND - gap - 50;
     // keep consecutive gaps reachable but varied
     const prev = pipes.length ? pipes[pipes.length - 1].top : (H - GROUND - gap) / 2;
-    const swing = 220;
+    const swing = 200 + 140 * Math.min(1, diff()); // bigger jumps between gaps over time
     const top = Math.min(maxTop, Math.max(minTop, prev + (Math.random() * 2 - 1) * swing));
     pipes.push({ x: W + 40, top, gap, w: 70, passed: false });
   }
@@ -228,10 +231,12 @@
       return;
     }
 
-    speed = 190 + score * 4;
-    gap = Math.max(130, 190 - score * 2);
+    playT += dt;
+    const d = diff();
+    speed = Math.min(700, 220 + 330 * d);      // 220 px/s -> 550 px/s at 90 s
+    gap = Math.max(28, 200 - 160 * d);          // 200 px -> 40 px at 90 s, smaller than the bird soon after
     spawnTimer -= dt;
-    if (spawnTimer <= 0) { spawn(); spawnTimer = 300 / speed + 0.9; }
+    if (spawnTimer <= 0) { spawn(); spawnTimer = Math.max(300, 420 - 120 * d) / speed; } // pipes get closer together too
 
     for (const p of pipes) {
       p.x -= speed * dt;
@@ -305,6 +310,9 @@
     if (state === 'play' || state === 'over') {
       ctx.font = 'bold 54px system-ui,sans-serif';
       ctx.strokeText(score, W / 2, 80); ctx.fillText(score, W / 2, 80);
+      const secs = Math.floor(playT), clock = `${Math.floor(secs / 60)}:${String(secs % 60).padStart(2, '0')}`;
+      ctx.font = 'bold 20px system-ui,sans-serif'; ctx.lineWidth = 4;
+      ctx.strokeText(clock, W / 2, 110); ctx.fillText(clock, W / 2, 110);
     }
     const ang = lidAngle !== null ? Math.round(lidAngle) + '°' : '—';
     if (state === 'connect') banner('LID FLAP', 'Step 1/4 · Press Space to connect the lid sensor');
@@ -316,7 +324,7 @@
       smallBanner(ready ? 'Step 4/4 · Feels good? Press Space to start  ·  C = recalibrate'
                         : `Step 4/4 · Test it: fly into both the TOP and BOTTOM zones  (${range})`);
     }
-    if (state === 'over') banner('GAME OVER', `Score ${score} · Best ${best} · Space to retry · C to recalibrate`);
+    if (state === 'over') banner('GAME OVER', `Score ${score} · Survived ${Math.floor(playT)} s · Best ${best} · Space to retry · C to recalibrate`);
   }
 
   function smallBanner(text) {
