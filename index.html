@@ -1,0 +1,427 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Lid Flap</title>
+<style>
+  :root { --bg:#0f1420; --fg:#e8ecf4; --mut:#8a93a6; --acc:#ffcc33; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.4 system-ui,-apple-system,sans-serif;
+         display:flex; flex-direction:column; align-items:center; min-height:100vh; }
+  header { width:min(900px,100%); display:flex; align-items:center; gap:12px; padding:14px 16px; flex-wrap:wrap; }
+  h1 { font-size:20px; margin:0; letter-spacing:.5px; }
+  h1 span { color:var(--acc); }
+  button { background:#232b3d; color:var(--fg); border:1px solid #39435a; border-radius:8px; padding:7px 12px;
+           font:inherit; cursor:pointer; }
+  button:hover { background:#2d3750; }
+  button.primary { background:var(--acc); color:#1a1300; border-color:var(--acc); font-weight:600; }
+  #status { color:var(--mut); font-size:13px; margin-left:auto; }
+  #wrap { position:relative; width:min(900px,100%); padding:0 16px; }
+  canvas { width:100%; display:block; border-radius:12px; background:#7ec8e3; touch-action:none; }
+  #gauge { position:absolute; right:28px; top:12px; width:120px; text-align:center; font-size:12px;
+           color:#10202a; font-weight:600; pointer-events:none; }
+  .row { width:min(900px,100%); padding:10px 16px; color:var(--mut); font-size:13px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }
+  .row b { color:var(--fg); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Lid <span>Flap</span></h1>
+  <button class="primary" id="connect">Connect lid sensor</button>
+  <button id="recal">Recalibrate</button>
+  <span id="status">Not connected</span>
+</header>
+<div id="wrap">
+  <canvas id="c" width="900" height="520"></canvas>
+  <div id="gauge"></div>
+</div>
+<div class="row">
+  <span><b>How to play:</b> the lid angle is your altitude. Open the lid wider to climb and tilt it closed to dive. Thread the gaps.</span>
+</div>
+<div class="row">
+  <span><b>Setup:</b> connect the sensor, then set your bottom and top lid angles and test the range before the game starts. Press <b>Space</b> to confirm each step. No sensor? Press <b>K</b> to play with the ↑/↓ keys.</span>
+</div>
+
+<script>
+(() => {
+  const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+  const W = cv.width, H = cv.height;
+  const statusEl = document.getElementById('status'), gaugeEl = document.getElementById('gauge');
+
+  // ---------- Input: lid angle (WebHID) with fallbacks ----------
+  let lidAngle = null;           // degrees from sensor, null if not connected
+  let lo = 70, hi = 115;        // calibration range (degrees)
+  try { const s = JSON.parse(localStorage.getItem('lidflap-cal')); if (s && s.hi > s.lo) { lo = s.lo; hi = s.hi; } } catch (e) {}
+  const saveCal = () => { try { localStorage.setItem('lidflap-cal', JSON.stringify({lo, hi})); } catch (e) {} };
+
+  let fallback = 0.5;            // 0..1 from ↑/↓ keys (keyboard mode only)
+  const keys = {};
+
+  function parseAngle(dv) {
+    if (!dv || dv.byteLength < 2) return null;
+    // Feature report may or may not include the report ID (1) as the first byte.
+    if (dv.byteLength >= 3 && dv.getUint8(0) === 1) return dv.getUint16(1, true);
+    return dv.getUint16(0, true);
+  }
+
+  async function connect() {
+    if (!('hid' in navigator)) {
+      statusEl.textContent = 'WebHID not available. Use Chrome or Edge on a MacBook.';
+      return;
+    }
+    try {
+      const filters = [{ vendorId: 0x05ac, productId: 0x8104, usagePage: 0x0020, usage: 0x008a }];
+      let [dev] = await navigator.hid.getDevices().then(ds => ds.filter(d => d.vendorId === 0x05ac && d.productId === 0x8104));
+      if (!dev) [dev] = await navigator.hid.requestDevice({ filters });
+      if (!dev) { statusEl.textContent = 'No sensor selected.'; return; }
+      if (!dev.opened) await dev.open();
+      dev.addEventListener('inputreport', e => { const a = parseAngle(e.data); if (a !== null && a <= 360) onSample(a); });
+      const poll = async () => {
+        try { const a = parseAngle(await dev.receiveFeatureReport(1)); if (a !== null && a <= 360) onSample(a); }
+        catch (e) { /* some models only send input reports */ }
+        setTimeout(poll, 0); // ask again as soon as the last answer arrives
+      };
+      poll();
+      statusEl.textContent = 'Lid sensor connected ✓';
+      keyboardMode = false;
+      if (state === 'connect') state = 'calBottom';
+    } catch (err) {
+      statusEl.textContent = 'Could not open sensor: ' + err.message + '. Try opening this file directly in Chrome.';
+    }
+  }
+  let keyboardMode = false;
+  document.getElementById('connect').onclick = e => { e.currentTarget.blur(); connect(); };
+  document.getElementById('recal').onclick = e => { e.currentTarget.blur(); recalibrate(); };
+
+  // Only the lid (or ↑/↓ in keyboard mode) steers. The mouse never moves the bird.
+  addEventListener('keydown', e => {
+    keys[e.key] = true;
+    if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); if (!e.repeat) action(); }
+    if (e.key === 'ArrowUp' || e.key === 'ArrowDown') e.preventDefault();
+    if ((e.key === 'k' || e.key === 'K') && state === 'connect') startKeyboardMode();
+    if ((e.key === 'c' || e.key === 'C') && (state === 'over' || state === 'test')) recalibrate();
+  });
+  addEventListener('keyup', e => { keys[e.key] = false; });
+  // No mouse/touch input on the game at all: the lid (or keyboard) is the only controller.
+  cv.addEventListener('contextmenu', e => e.preventDefault());
+
+  function startKeyboardMode() {
+    keyboardMode = true; fallback = 0.5;
+    statusEl.textContent = 'Keyboard mode (↑/↓)';
+    enterTest();
+  }
+  function recalibrate() {
+    if (keyboardMode || lidAngle === null) { state = 'connect'; return; }
+    state = 'calBottom'; calMsg = '';
+  }
+  function enterTest() {
+    state = 'test'; testTop = false; testBottom = false; reset();
+  }
+
+  // One key drives the whole menu: Space / Enter.
+  let calMsg = '', testTop = false, testBottom = false;
+  function action() {
+    switch (state) {
+      case 'connect': connect(); break;
+      case 'calBottom':
+        if (lidAngle === null) return;
+        lo = lidAngle; calMsg = ''; state = 'calTop'; break;
+      case 'calTop':
+        if (lidAngle === null) return;
+        if (lidAngle - lo < 10) { calMsg = `Open the lid at least 10° more than the bottom (${Math.round(lo)}°)`; return; }
+        hi = lidAngle; saveCal(); enterTest(); break;
+      case 'test':
+        if (testTop && testBottom) { reset(); state = 'play'; }
+        break;
+      case 'over':
+        if (t > 0.6) { reset(); state = 'play'; }
+        break;
+    }
+  }
+
+  // Track lid velocity so we can look slightly ahead and hide sensor latency.
+  let lastA = null, lastT = 0, lidVel = 0;
+  function onSample(a) {
+    const now = performance.now();
+    sampleCount++;
+    if (a !== lastA) changeCount++;
+    if (lastA !== null && a !== lastA) {
+      const dtS = Math.max(0.004, (now - lastT) / 1000);
+      lidVel = lidVel * 0.5 + ((a - lastA) / dtS) * 0.5;   // deg/s, lightly smoothed
+      lastT = now;
+    } else if (lastA === null) lastT = now;
+    if (now - lastT > 80) lidVel *= 0.5;                    // lid stopped moving
+    lastA = a; lidAngle = a;
+  }
+  const LOOKAHEAD = 0.04; // seconds of prediction
+
+  // Response modes: 1 = Direct (no smoothing), 2 = Snappy, 3 = Smooth
+  const MODES = [{ name: 'Direct', w: 0 }, { name: 'Snappy', w: 30 }, { name: 'Smooth', w: 14 }];
+  let mode = 0;
+  try { const m = +localStorage.getItem('lidflap-mode'); if (m >= 0 && m < 3) mode = m; } catch (e) {}
+  addEventListener('keydown', e => {
+    const i = ['1', '2', '3'].indexOf(e.key);
+    if (i >= 0) { mode = i; try { localStorage.setItem('lidflap-mode', i); } catch (_) {} }
+  });
+
+  // Measure how often the sensor actually delivers readings (the real latency floor).
+  let sampleCount = 0, changeCount = 0, sampleHz = 0, changeHz = 0;
+  setInterval(() => { sampleHz = sampleCount; changeHz = changeCount; sampleCount = changeCount = 0; }, 1000);
+
+  // 0 = bottom, 1 = top
+  function control() {
+    if (lidAngle !== null) {
+      const stale = (performance.now() - lastT) > 80;
+      const pred = lidAngle + (stale ? 0 : lidVel * LOOKAHEAD);
+      return Math.min(1, Math.max(0, (pred - lo) / (hi - lo)));
+    }
+    return fallback;
+  }
+
+  // ---------- Game ----------
+  const GROUND = 60, BIRD_X = 200, R = 16;
+  const TOP_Y = R + 10, BOT_Y = H - GROUND - R - 10; // bird's reachable band
+  let state = 'connect', score = 0, best = 0, t = 0;
+  try { best = +localStorage.getItem('lidflap-best') || 0; } catch (e) {}
+  let bird, pipes, speed, gap, spawnTimer, particles, clouds;
+
+  function reset() {
+    bird = { y: H / 2, vy: 0, tilt: 0 };
+    pipes = []; particles = [];
+    speed = 190; gap = 190; spawnTimer = 0.6; score = 0;
+  }
+  clouds = Array.from({ length: 6 }, (_, i) => ({ x: i * 170 + Math.random() * 80, y: 40 + Math.random() * 160, s: 0.6 + Math.random() * 0.8 }));
+  reset();
+
+  function spawn() {
+    const minTop = 50, maxTop = H - GROUND - gap - 50;
+    // keep consecutive gaps reachable but varied
+    const prev = pipes.length ? pipes[pipes.length - 1].top : (H - GROUND - gap) / 2;
+    const swing = 220;
+    const top = Math.min(maxTop, Math.max(minTop, prev + (Math.random() * 2 - 1) * swing));
+    pipes.push({ x: W + 40, top, gap, w: 70, passed: false });
+  }
+
+  function update(dt) {
+    t += dt;
+    // keyboard fallback nudges the virtual stick
+    if (keyboardMode) {
+      if (keys.ArrowUp) fallback = Math.min(1, fallback + dt * 2.2);
+      if (keys.ArrowDown) fallback = Math.max(0, fallback - dt * 2.2);
+    }
+    const targetY = TOP_Y + (1 - control()) * (BOT_Y - TOP_Y);
+
+    for (const c of clouds) { c.x -= dt * 20 * c.s; if (c.x < -120) { c.x = W + 60; c.y = 40 + Math.random() * 160; } }
+
+    if (state === 'connect' || state === 'calBottom' || state === 'calTop') {
+      bird.y += (H / 2 - 30 - bird.y) * Math.min(1, dt * 5);
+      bird.tilt = 0;
+      return;
+    }
+    if (state === 'over') {
+      bird.vy += 1400 * dt; bird.y = Math.min(H - GROUND - R, bird.y + bird.vy * dt);
+      bird.tilt = Math.min(1.4, bird.tilt + dt * 4);
+      updateParticles(dt);
+      return;
+    }
+
+    if (MODES[mode].w === 0) {
+      // Direct: the bird sits exactly where the lid says, with zero added latency.
+      bird.vy = (targetY - bird.y) / Math.max(dt, 1e-3);
+      bird.y = targetY;
+    } else {
+      // critically damped spring toward the lid-commanded height
+      const w = MODES[mode].w, k = w * w, damp = 2 * w;
+      const steps = 4, h = dt / steps; // substep so the stiff spring stays stable
+      for (let i = 0; i < steps; i++) {
+        bird.vy += ((targetY - bird.y) * k - bird.vy * damp) * h;
+        bird.y += bird.vy * h;
+      }
+    }
+    bird.tilt = Math.max(-0.6, Math.min(0.9, bird.vy / 600));
+
+    if (state === 'test') {
+      const c = control();
+      if (c > 0.9) testTop = true;
+      if (c < 0.1) testBottom = true;
+      return;
+    }
+
+    speed = 190 + score * 4;
+    gap = Math.max(130, 190 - score * 2);
+    spawnTimer -= dt;
+    if (spawnTimer <= 0) { spawn(); spawnTimer = 300 / speed + 0.9; }
+
+    for (const p of pipes) {
+      p.x -= speed * dt;
+      if (!p.passed && p.x + p.w < BIRD_X) { p.passed = true; score++; burst(BIRD_X, bird.y, '#ffcc33', 8); }
+      // collision
+      const cx = Math.max(p.x, Math.min(BIRD_X, p.x + p.w));
+      if (Math.abs(cx - BIRD_X) < R) {
+        if (bird.y - R + 3 < p.top || bird.y + R - 3 > p.top + p.gap) die();
+      }
+    }
+    pipes = pipes.filter(p => p.x > -p.w - 10);
+    updateParticles(dt);
+  }
+
+  function die() {
+    if (state !== 'play') return;
+    state = 'over'; t = 0; bird.vy = -200;
+    burst(BIRD_X, bird.y, '#ffffff', 20);
+    if (score > best) { best = score; try { localStorage.setItem('lidflap-best', best); } catch (e) {} }
+  }
+
+  function burst(x, y, col, n) {
+    for (let i = 0; i < n; i++) {
+      const a = Math.random() * Math.PI * 2, v = 80 + Math.random() * 180;
+      particles.push({ x, y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 0.6, col });
+    }
+  }
+  function updateParticles(dt) {
+    for (const p of particles) { p.x += p.vx * dt; p.y += p.vy * dt; p.vy += 400 * dt; p.life -= dt; }
+    particles = particles.filter(p => p.life > 0);
+  }
+
+  // ---------- Render ----------
+  let groundOff = 0;
+  function draw(dt) {
+    const sky = ctx.createLinearGradient(0, 0, 0, H);
+    sky.addColorStop(0, '#5ab4dc'); sky.addColorStop(1, '#bfe8f2');
+    ctx.fillStyle = sky; ctx.fillRect(0, 0, W, H);
+
+    ctx.fillStyle = 'rgba(255,255,255,.85)';
+    for (const c of clouds) {
+      ctx.beginPath();
+      ctx.ellipse(c.x, c.y, 50 * c.s, 18 * c.s, 0, 0, 7);
+      ctx.ellipse(c.x + 30 * c.s, c.y - 10 * c.s, 32 * c.s, 18 * c.s, 0, 0, 7);
+      ctx.fill();
+    }
+
+    for (const p of pipes) {
+      drawPipe(p.x, 0, p.w, p.top, true);
+      drawPipe(p.x, p.top + p.gap, p.w, H - GROUND - p.top - p.gap, false);
+    }
+
+    if (state === 'test') drawTestZones();
+
+    // ground
+    if (state === 'play' || state === 'test') groundOff = (groundOff + speed * dt) % 40;
+    ctx.fillStyle = '#d9c27a'; ctx.fillRect(0, H - GROUND, W, GROUND);
+    ctx.fillStyle = '#6fbf4a'; ctx.fillRect(0, H - GROUND, W, 12);
+    ctx.fillStyle = '#5aa63a';
+    for (let x = -groundOff; x < W; x += 40) ctx.fillRect(x, H - GROUND, 20, 12);
+
+    drawBird();
+
+    for (const p of particles) { ctx.globalAlpha = Math.max(0, p.life / 0.6); ctx.fillStyle = p.col; ctx.fillRect(p.x - 3, p.y - 3, 6, 6); }
+    ctx.globalAlpha = 1;
+
+    drawLidMeter();
+
+    ctx.textAlign = 'center';
+    ctx.lineWidth = 6; ctx.strokeStyle = '#1b2a33'; ctx.fillStyle = '#fff';
+    if (state === 'play' || state === 'over') {
+      ctx.font = 'bold 54px system-ui,sans-serif';
+      ctx.strokeText(score, W / 2, 80); ctx.fillText(score, W / 2, 80);
+    }
+    const ang = lidAngle !== null ? Math.round(lidAngle) + '°' : '—';
+    if (state === 'connect') banner('LID FLAP', 'Step 1/4 · Press Space to connect the lid sensor  ·  K = keyboard mode');
+    if (state === 'calBottom') banner(`BOTTOM  ${ang}`, 'Step 2/4 · Tilt the lid to your lowest comfortable angle, then press Space', calMsg);
+    if (state === 'calTop') banner(`TOP  ${ang}`, `Step 3/4 · Open the lid to your highest angle, then press Space  (bottom = ${Math.round(lo)}°)`, calMsg);
+    if (state === 'test') {
+      const ready = testTop && testBottom;
+      const range = keyboardMode ? 'keyboard ↑/↓' : `range ${Math.round(lo)}°–${Math.round(hi)}°`;
+      smallBanner(ready ? 'Step 4/4 · Feels good? Press Space to start  ·  C = recalibrate'
+                        : `Step 4/4 · Test it: fly into both the TOP and BOTTOM zones  (${range})`);
+    }
+    if (state === 'over') banner('GAME OVER', `Score ${score} · Best ${best} · Space to retry · C to recalibrate`);
+  }
+
+  function smallBanner(text) {
+    ctx.fillStyle = 'rgba(15,20,32,.6)'; ctx.fillRect(0, H / 2 - 22, W, 40);
+    ctx.fillStyle = '#fff'; ctx.font = '17px system-ui,sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(text, W / 2, H / 2 + 4);
+  }
+
+  function drawTestZones() {
+    const zh = (BOT_Y - TOP_Y) * 0.1 + R;
+    const zone = (y, done, label) => {
+      ctx.fillStyle = done ? 'rgba(80,200,90,.45)' : 'rgba(255,204,51,.35)';
+      ctx.fillRect(0, y, W, zh);
+      ctx.fillStyle = done ? '#0d3d14' : '#4a3a00';
+      ctx.font = 'bold 15px system-ui,sans-serif'; ctx.textAlign = 'left';
+      ctx.fillText((done ? '✓ ' : '') + label, 420, y + zh / 2 + 5);
+    };
+    zone(0, testTop, 'TOP');
+    zone(H - GROUND - zh, testBottom, 'BOTTOM');
+  }
+
+  function banner(title, sub, extra) {
+    ctx.fillStyle = 'rgba(15,20,32,.55)'; ctx.fillRect(0, H / 2 - 70, W, 120);
+    ctx.fillStyle = '#ffcc33'; ctx.font = 'bold 46px system-ui,sans-serif'; ctx.fillText(title, W / 2, H / 2 - 12);
+    ctx.fillStyle = '#fff'; ctx.font = '18px system-ui,sans-serif'; ctx.fillText(sub, W / 2, H / 2 + 26);
+    if (extra) { ctx.fillStyle = '#ff9a8a'; ctx.font = 'bold 16px system-ui,sans-serif'; ctx.fillText(extra, W / 2, H / 2 + 74); }
+  }
+
+  function drawPipe(x, y, w, h, top) {
+    if (h <= 0) return;
+    const g = ctx.createLinearGradient(x, 0, x + w, 0);
+    g.addColorStop(0, '#4f9d2d'); g.addColorStop(.45, '#8fd65a'); g.addColorStop(1, '#3f8423');
+    ctx.fillStyle = g; ctx.fillRect(x, y, w, h);
+    ctx.strokeStyle = '#2b5c17'; ctx.lineWidth = 3; ctx.strokeRect(x, y, w, h);
+    const lipY = top ? y + h - 24 : y;
+    ctx.fillStyle = g; ctx.fillRect(x - 6, lipY, w + 12, 24); ctx.strokeRect(x - 6, lipY, w + 12, 24);
+  }
+
+  // The bird is a tiny laptop whose screen flaps with your real lid angle.
+  function drawBird() {
+    ctx.save();
+    ctx.translate(BIRD_X, bird.y);
+    ctx.rotate(bird.tilt * 0.6);
+    // base
+    ctx.fillStyle = '#c9ced8'; ctx.strokeStyle = '#3a4150'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.roundRect(-20, 4, 40, 8, 3); ctx.fill(); ctx.stroke();
+    // lid hinged at back-left of base, opening angle follows control
+    const open = 0.35 + control() * 1.9; // radians
+    ctx.save();
+    ctx.translate(-18, 6);
+    ctx.rotate(-open);
+    ctx.fillStyle = '#d8dde6';
+    ctx.beginPath(); ctx.roundRect(0, -4, 36, 6, 2); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = '#2e6bd8'; ctx.fillRect(4, -3, 28, 3);
+    ctx.restore();
+    // eye on the base front, for charm
+    ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.arc(12, 8, 3.2, 0, 7); ctx.fill();
+    ctx.fillStyle = '#111'; ctx.beginPath(); ctx.arc(13, 8, 1.6, 0, 7); ctx.fill();
+    ctx.restore();
+  }
+
+  function drawLidMeter() {
+    const x = W - 46, y = 20, h = 160;
+    ctx.fillStyle = 'rgba(15,20,32,.35)'; ctx.beginPath(); ctx.roundRect(x - 14, y - 6, 40, h + 40, 8); ctx.fill();
+    ctx.fillStyle = 'rgba(255,255,255,.35)'; ctx.fillRect(x, y, 12, h);
+    const v = control();
+    ctx.fillStyle = '#ffcc33'; ctx.fillRect(x, y + h - v * h, 12, v * h);
+    ctx.fillStyle = '#fff'; ctx.font = '11px system-ui,sans-serif'; ctx.textAlign = 'center';
+    ctx.fillText(lidAngle !== null ? Math.round(lidAngle) + '°' : 'keys', x + 6, y + h + 20);
+    // response mode + live sensor rate
+    ctx.textAlign = 'left'; ctx.font = '12px system-ui,sans-serif';
+    ctx.fillStyle = 'rgba(15,20,32,.45)'; ctx.beginPath(); ctx.roundRect(12, H - GROUND - 34, lidAngle !== null ? 440 : 200, 24, 6); ctx.fill();
+    ctx.fillStyle = '#fff';
+    const rate = lidAngle !== null ? `  ·  sensor ${sampleHz} Hz (${changeHz} changes/s)` : '';
+    ctx.fillText(`Response: ${MODES[mode].name} [1/2/3]${rate}`, 20, H - GROUND - 18);
+  }
+
+  let last = performance.now();
+  function loop(now) {
+    const dt = Math.min(0.033, (now - last) / 1000); last = now;
+    update(dt); draw(dt);
+    requestAnimationFrame(loop);
+  }
+  requestAnimationFrame(loop);
+})();
+</script>
+</body>
+</html>
