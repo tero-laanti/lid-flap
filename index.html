@@ -29,7 +29,6 @@
 <header>
   <h1>Lid <span>Flap</span></h1>
   <button class="primary" id="connect">Connect lid sensor</button>
-  <button id="recal">Recalibrate</button>
   <span id="status">Not connected</span>
 </header>
 <div id="wrap">
@@ -40,7 +39,7 @@
   <span><b>How to play:</b> the lid angle is your altitude. Open the lid wider to climb and tilt it closed to dive. Thread the gaps.</span>
 </div>
 <div class="row">
-  <span><b>Setup:</b> connect the sensor, then set your bottom and top lid angles and test the range before the game starts. Press <b>Space</b> to confirm each step. No sensor? Press <b>K</b> to play with the ↑/↓ keys.</span>
+  <span><b>Setup:</b> connect the sensor, then set your bottom and top lid angles and test the range before the game starts. Press <b>Space</b> to confirm each step. Press <b>C</b> on the test or game-over screen to recalibrate. The lid is the only controller: no mouse, no keyboard steering.</span>
 </div>
 
 <script>
@@ -49,14 +48,12 @@
   const W = cv.width, H = cv.height;
   const statusEl = document.getElementById('status'), gaugeEl = document.getElementById('gauge');
 
-  // ---------- Input: lid angle (WebHID) with fallbacks ----------
+  // ---------- Input: lid angle (WebHID) only ----------
   let lidAngle = null;           // degrees from sensor, null if not connected
   let lo = 70, hi = 115;        // calibration range (degrees)
   try { const s = JSON.parse(localStorage.getItem('lidflap-cal')); if (s && s.hi > s.lo) { lo = s.lo; hi = s.hi; } } catch (e) {}
   const saveCal = () => { try { localStorage.setItem('lidflap-cal', JSON.stringify({lo, hi})); } catch (e) {} };
 
-  let fallback = 0.5;            // 0..1 from ↑/↓ keys (keyboard mode only)
-  const keys = {};
 
   function parseAngle(dv) {
     if (!dv || dv.byteLength < 2) return null;
@@ -84,35 +81,23 @@
       };
       poll();
       statusEl.textContent = 'Lid sensor connected ✓';
-      keyboardMode = false;
       if (state === 'connect') state = 'calBottom';
     } catch (err) {
       statusEl.textContent = 'Could not open sensor: ' + err.message + '. Try opening this file directly in Chrome.';
     }
   }
-  let keyboardMode = false;
   document.getElementById('connect').onclick = e => { e.currentTarget.blur(); connect(); };
-  document.getElementById('recal').onclick = e => { e.currentTarget.blur(); recalibrate(); };
 
-  // Only the lid (or ↑/↓ in keyboard mode) steers. The mouse never moves the bird.
+  // Only the lid steers. Keys are just for menus; the mouse does nothing in the game.
   addEventListener('keydown', e => {
-    keys[e.key] = true;
     if (e.key === ' ' || e.key === 'Enter') { e.preventDefault(); if (!e.repeat) action(); }
-    if (e.key === 'ArrowUp' || e.key === 'ArrowDown') e.preventDefault();
-    if ((e.key === 'k' || e.key === 'K') && state === 'connect') startKeyboardMode();
     if ((e.key === 'c' || e.key === 'C') && (state === 'over' || state === 'test')) recalibrate();
   });
-  addEventListener('keyup', e => { keys[e.key] = false; });
-  // No mouse/touch input on the game at all: the lid (or keyboard) is the only controller.
+  // No mouse/touch input on the game at all: the lid is the only controller.
   cv.addEventListener('contextmenu', e => e.preventDefault());
 
-  function startKeyboardMode() {
-    keyboardMode = true; fallback = 0.5;
-    statusEl.textContent = 'Keyboard mode (↑/↓)';
-    enterTest();
-  }
   function recalibrate() {
-    if (keyboardMode || lidAngle === null) { state = 'connect'; return; }
+    if (lidAngle === null) { state = 'connect'; return; }
     state = 'calBottom'; calMsg = '';
   }
   function enterTest() {
@@ -176,7 +161,7 @@
       const pred = lidAngle + (stale ? 0 : lidVel * LOOKAHEAD);
       return Math.min(1, Math.max(0, (pred - lo) / (hi - lo)));
     }
-    return fallback;
+    return 0.5;
   }
 
   // ---------- Game ----------
@@ -205,11 +190,6 @@
 
   function update(dt) {
     t += dt;
-    // keyboard fallback nudges the virtual stick
-    if (keyboardMode) {
-      if (keys.ArrowUp) fallback = Math.min(1, fallback + dt * 2.2);
-      if (keys.ArrowDown) fallback = Math.max(0, fallback - dt * 2.2);
-    }
     const targetY = TOP_Y + (1 - control()) * (BOT_Y - TOP_Y);
 
     for (const c of clouds) { c.x -= dt * 20 * c.s; if (c.x < -120) { c.x = W + 60; c.y = 40 + Math.random() * 160; } }
@@ -327,12 +307,12 @@
       ctx.strokeText(score, W / 2, 80); ctx.fillText(score, W / 2, 80);
     }
     const ang = lidAngle !== null ? Math.round(lidAngle) + '°' : '—';
-    if (state === 'connect') banner('LID FLAP', 'Step 1/4 · Press Space to connect the lid sensor  ·  K = keyboard mode');
+    if (state === 'connect') banner('LID FLAP', 'Step 1/4 · Press Space to connect the lid sensor');
     if (state === 'calBottom') banner(`BOTTOM  ${ang}`, 'Step 2/4 · Tilt the lid to your lowest comfortable angle, then press Space', calMsg);
     if (state === 'calTop') banner(`TOP  ${ang}`, `Step 3/4 · Open the lid to your highest angle, then press Space  (bottom = ${Math.round(lo)}°)`, calMsg);
     if (state === 'test') {
       const ready = testTop && testBottom;
-      const range = keyboardMode ? 'keyboard ↑/↓' : `range ${Math.round(lo)}°–${Math.round(hi)}°`;
+      const range = `range ${Math.round(lo)}°–${Math.round(hi)}°`;
       smallBanner(ready ? 'Step 4/4 · Feels good? Press Space to start  ·  C = recalibrate'
                         : `Step 4/4 · Test it: fly into both the TOP and BOTTOM zones  (${range})`);
     }
@@ -405,7 +385,7 @@
     const v = control();
     ctx.fillStyle = '#ffcc33'; ctx.fillRect(x, y + h - v * h, 12, v * h);
     ctx.fillStyle = '#fff'; ctx.font = '11px system-ui,sans-serif'; ctx.textAlign = 'center';
-    ctx.fillText(lidAngle !== null ? Math.round(lidAngle) + '°' : 'keys', x + 6, y + h + 20);
+    ctx.fillText(lidAngle !== null ? Math.round(lidAngle) + '°' : '—', x + 6, y + h + 20);
     // response mode + live sensor rate
     ctx.textAlign = 'left'; ctx.font = '12px system-ui,sans-serif';
     ctx.fillStyle = 'rgba(15,20,32,.45)'; ctx.beginPath(); ctx.roundRect(12, H - GROUND - 34, lidAngle !== null ? 440 : 200, 24, 6); ctx.fill();
